@@ -133,8 +133,10 @@ func TestPerfEventAttrSize(t *testing.T) {
 // reads one; it is skipped only on a kernel without what its mode needs, see
 // probeModeSkip, and otherwise must attach. A probe case that reads a cookie
 // retypes cookie.bpf.o's tracepoint program as a kprobe program, as the
-// oracle does. A case without a known mode, as in a fixture older than the
-// mode field, fails once the load has shown the test can attach.
+// oracle does. A fentry, fexit or fmod_ret case skips before the load when
+// the kernel BTF has no FUNC of its target. A case without a known mode, as
+// in a fixture older than the mode field, fails once the load has shown the
+// test can attach.
 func TestBpfProgramAttachTypes(t *testing.T) {
 	f := loadAttachFixture(t)
 
@@ -148,6 +150,9 @@ func TestBpfProgramAttachTypes(t *testing.T) {
 			}
 			if c.Kind == "cookie" && !perfLinkSupported() {
 				t.Skip("BPF cookies and perf links are not supported by this kernel")
+			}
+			if c.Kind == "fentry" || c.Kind == "fexit" || c.Kind == "fmod_ret" {
+				skipIfKernelLacksFunc(t, c.Target)
 			}
 			mode, known := attachModes[c.Mode]
 			if known && c.probe() {
@@ -251,6 +256,9 @@ func TestBpfProgramAttachPerfEventIoctl(t *testing.T) {
 func TestBpfProgramAttachAuto(t *testing.T) {
 	for _, path := range []string{"kprobe.bpf.o", "fentry.bpf.o"} {
 		t.Run(path, func(t *testing.T) {
+			if path == "fentry.bpf.o" {
+				skipIfKernelLacksFunc(t, fentryTarget)
+			}
 			obj := loadTestObject(t, "../testdata/progs/"+path)
 			defer BpfObjectClose(obj)
 
@@ -276,6 +284,7 @@ func TestBpfProgramAttachAuto(t *testing.T) {
 }
 
 func TestBpfLinkPin(t *testing.T) {
+	skipIfKernelLacksFunc(t, fentryTarget)
 	obj := loadTestObject(t, "../testdata/progs/fentry.bpf.o")
 	defer BpfObjectClose(obj)
 	prog := BpfObjectFindProgramByName(obj, "handle_fentry")
@@ -563,9 +572,30 @@ func bpfLsmActive() bool {
 	return false
 }
 
+// isAttachUnsupported reports whether err is an errno the kernel returns
+// for an attach it does not support. ENOTSUPP (524) is the errno of a kernel
+// without a BPF trampoline, such as arm64 before 6.0, for fentry and fexit.
 func isAttachUnsupported(err error) bool {
 	return errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, unix.EINVAL) ||
-		errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTSUP)
+		errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENOTSUP) ||
+		errors.Is(err, enotsupp)
+}
+
+// fentryTarget is the kernel function the programs of fentry.bpf.o attach
+// to.
+const fentryTarget = "do_sys_openat2"
+
+// skipIfKernelLacksFunc skips the test when the running kernel's BTF has no
+// FUNC name. A fentry, fexit or fmod_ret program against such a function
+// fails to load with ENOENT; the arm64 5.10 BTF, for one, has no
+// do_sys_openat2. It fails the test when the kernel BTF cannot be read, like
+// kernelFuncHas.
+func skipIfKernelLacksFunc(t *testing.T, name string) {
+	t.Helper()
+
+	if !kernelFuncHas(t, name) {
+		t.Skipf("kernel BTF has no FUNC %s", name)
+	}
 }
 
 func programNameForObject(path string) string {

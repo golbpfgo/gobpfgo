@@ -201,42 +201,28 @@ func TestAttachIter(t *testing.T) {
 // to the target's descriptor with SetAttachTarget, loads it, and attaches
 // it with AttachFreplace in place of xdp_pass: with the target's descriptor
 // and function name, and without a target, which attaches to the load-time
-// target. Each case loads freplace.bpf.o again, because the kernel forgets
-// the load-time target after the first attach. Each Link must be a tracing
-// link of the program with attach type 0 whose fdinfo names the target
-// program's id and the BTF id of xdp_pass, which kernels before 6.5 do not
-// print, and Destroy must release it. It needs root and skips when the
-// kernel refuses bpf(), and with the kernel's errno when the kernel BTF has
-// no program extensions.
+// target. Each case loads xdp.bpf.o and freplace.bpf.o again: the kernel
+// forgets the load-time target after the first attach, and a kernel that
+// refuses the attach with ENOTSUPP keeps the refused extension on the
+// target's trampoline and refuses every later extension of that target with
+// EBUSY. Each Link must be a tracing link of the program with attach type 0
+// whose fdinfo names the target program's id and the BTF id of xdp_pass,
+// which kernels before 6.5 do not print, and Destroy must release it. It
+// needs root and skips when the kernel refuses bpf(), and with the kernel's
+// errno when the kernel BTF has no program extensions or the kernel cannot
+// attach them, see skipIfKernelLacksExt.
 func TestAttachFreplace(t *testing.T) {
-	target, err := bpf.OpenFile(progsDir+"/xdp.bpf.o", nil)
-	if err != nil {
-		t.Fatalf("OpenFile target: %v", err)
-	}
-	defer target.Close()
-	if err := target.Load(); err != nil {
-		skipIfNotPermitted(t, "bpf()", err)
-		t.Fatalf("Load target: %v", err)
-	}
-	targetProg := target.Program("xdp_pass")
-	targetFD := targetProg.FD()
-	targetInfo, err := targetProg.Info()
-	if err != nil {
-		t.Fatalf("target Info: %v", err)
-	}
-	if targetInfo.BtfID == 0 {
-		t.Fatal("target BtfID = 0, want the BTF xdp.bpf.o was loaded with")
-	}
 	funcID := objectFuncID(t, progsDir+"/xdp.bpf.o", "xdp_pass")
 
-	attaches := map[string]func(*bpf.Program) (*bpf.Link, error){
-		"target":    func(p *bpf.Program) (*bpf.Link, error) { return p.AttachFreplace(targetFD, "xdp_pass") },
-		"no target": func(p *bpf.Program) (*bpf.Link, error) { return p.AttachFreplace(0, "") },
+	attaches := map[string]func(p *bpf.Program, targetFD int) (*bpf.Link, error){
+		"target":    func(p *bpf.Program, targetFD int) (*bpf.Link, error) { return p.AttachFreplace(targetFD, "xdp_pass") },
+		"no target": func(p *bpf.Program, _ int) (*bpf.Link, error) { return p.AttachFreplace(0, "") },
 	}
 	for name, attach := range attaches {
 		t.Run(name, func(t *testing.T) {
+			targetFD, targetInfo := loadFreplaceTarget(t)
 			prog := loadFreplace(t, targetFD)
-			link, err := attach(prog)
+			link, err := attach(prog, targetFD)
 			if err != nil {
 				skipIfNotPermitted(t, "freplace attach", err)
 				skipIfKernelLacksExt(t, err)
@@ -251,6 +237,33 @@ func TestAttachFreplace(t *testing.T) {
 			}
 		})
 	}
+}
+
+// loadFreplaceTarget loads xdp.bpf.o, closed when the test ends, and
+// returns the descriptor and info of its xdp_pass program, which must report
+// the BTF id xdp.bpf.o was loaded with. It skips when the kernel refuses
+// bpf().
+func loadFreplaceTarget(t *testing.T) (int, *libbpf.BpfProgInfo) {
+	t.Helper()
+
+	target, err := bpf.OpenFile(progsDir+"/xdp.bpf.o", nil)
+	if err != nil {
+		t.Fatalf("OpenFile target: %v", err)
+	}
+	t.Cleanup(func() { target.Close() })
+	if err := target.Load(); err != nil {
+		skipIfNotPermitted(t, "bpf()", err)
+		t.Fatalf("Load target: %v", err)
+	}
+	prog := target.Program("xdp_pass")
+	info, err := prog.Info()
+	if err != nil {
+		t.Fatalf("target Info: %v", err)
+	}
+	if info.BtfID == 0 {
+		t.Fatal("target BtfID = 0, want the BTF xdp.bpf.o was loaded with")
+	}
+	return prog.FD(), info
 }
 
 // loadFreplace opens freplace.bpf.o, closed when the test ends, sets its
@@ -281,12 +294,17 @@ func loadFreplace(t *testing.T, targetFD int) *bpf.Program {
 }
 
 // skipIfKernelLacksExt skips with err when the running kernel's BTF has no
-// BPF_PROG_TYPE_EXT, the program type of freplace programs.
+// BPF_PROG_TYPE_EXT, the program type of freplace programs, or when err is
+// ENOTSUPP (524), which a kernel that cannot patch the target returns: arm64
+// has no BPF trampoline or text poke before 6.0.
 func skipIfKernelLacksExt(t *testing.T, err error) {
 	t.Helper()
 
 	if !kernelEnumHas(t, "bpf_prog_type", "BPF_PROG_TYPE_EXT") {
 		t.Skipf("kernel lacks program extensions: %v", err)
+	}
+	if errors.Is(err, enotsupp) {
+		t.Skipf("kernel cannot attach program extensions, no BPF trampoline or text poke as on arm64 before 6.0: %v", err)
 	}
 }
 

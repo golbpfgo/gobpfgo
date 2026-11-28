@@ -19,7 +19,8 @@ import (
 )
 
 // enotsupp is the kernel's ENOTSUPP (524), which a kernel before 5.14
-// returns for LookupAndDelete on a hash map.
+// returns for LookupAndDelete on a hash map, and a kernel without a BPF
+// trampoline for an freplace attach.
 const enotsupp = syscall.Errno(524)
 
 // u32Key and u64Value encode a 4-byte key and an 8-byte value in native byte
