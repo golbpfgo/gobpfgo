@@ -78,19 +78,26 @@ func TestKsymsLoadTyped(t *testing.T) {
 // TestKsymsLoadAddr links link_ksyms_addr.bpf.o, loads it, attaches
 // handle_ksyms_addr and opens a file. The program stores the addresses of
 // its typeless .ksyms externs, which must be the /proc/kallsyms addresses.
-// It needs root or CAP_BPF, skips otherwise, and also skips when kallsyms
-// hides the addresses.
+// Before the load, which resolves those externs from /proc/kallsyms, it
+// skips when /proc/kallsyms lacks either symbol, as a kernel without
+// CONFIG_KALLSYMS_ALL lists no data symbols, or hides its address. It needs
+// root or CAP_BPF and skips otherwise.
 func TestKsymsLoadAddr(t *testing.T) {
 	path := linkObjects(t, ksymsAddrProg)
-	obj := loadTestObject(t, path)
-	defer BpfObjectClose(obj)
 
 	want := kallsymsAddrs(t, ksymPerCPU, ksymTask)
 	for _, name := range []string{ksymPerCPU, ksymTask} {
-		if want[name] == 0 {
+		addr, ok := want[name]
+		if !ok {
+			t.Skipf("/proc/kallsyms has no %s: the kernel lists data symbols only with CONFIG_KALLSYMS_ALL", name)
+		}
+		if addr == 0 {
 			t.Skipf("/proc/kallsyms hides %s", name)
 		}
 	}
+
+	obj := loadTestObject(t, path)
+	defer BpfObjectClose(obj)
 
 	attachKprobes(t, obj, map[string]string{"handle_ksyms_addr": "do_sys_openat2"})
 	triggerOpen(t)

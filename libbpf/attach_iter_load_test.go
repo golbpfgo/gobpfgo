@@ -120,45 +120,49 @@ func loadIterObject(t *testing.T, object, prog, target string) *BpfObject {
 // program in place of xdp_pass: with the target descriptor and
 // function name, which sends the target and its BTF id through
 // BPF_LINK_CREATE; without a target, which attaches to the load-time target;
-// and through the section name. Each case loads freplace.bpf.o again,
-// because the kernel forgets the load-time target after the first attach.
-// The link must be a tracing link with attach type 0 whose fdinfo names the
-// target program's id and the BTF id of xdp_pass in its BTF; kernels before
-// 6.5 do not print those ids and skip that check. The target program must
-// report the object's BTF id. It skips with the kernel's errno when the
-// kernel BTF has no program extensions.
+// and through the section name. Each case loads xdp.bpf.o and
+// freplace.bpf.o again: the kernel forgets the load-time target after the
+// first attach, and a kernel that refuses the attach with ENOTSUPP keeps the
+// refused extension on the target's trampoline and refuses every later
+// extension of that target with EBUSY. The link must be a tracing link with
+// attach type 0 whose fdinfo names the target program's id and the BTF id
+// of xdp_pass in its BTF; kernels before 6.5 do not print those ids and skip
+// that check. The target program must report the object's BTF id. It skips
+// with the kernel's errno when the kernel BTF has no program extensions or
+// the kernel cannot attach them, see checkFreplaceAttach.
 //
 // The target is not kprobe.bpf.o's handle_open: its void * argument is not
 // the kprobe context type, so the kernel marks the function's BTF
 // unreliable and refuses to replace it with "Cannot replace static
 // functions".
 func TestBpfProgramAttachFreplace(t *testing.T) {
-	target := loadTestObject(t, progsDir+"/xdp.bpf.o")
-	defer BpfObjectClose(target)
-	targetProg := findProgram(t, target, "xdp_pass")
-	checkProgramBtfID(t, target, targetProg)
-	fn := target.btf.Find("xdp_pass", btf.KindFunc)
-	if fn == nil {
-		t.Fatal("xdp.bpf.o BTF has no FUNC xdp_pass")
-	}
-
 	attaches := []struct {
 		name     string
 		loadName string
-		attach   func(*BpfProgram) (*BpfLink, error)
+		attach   func(p *BpfProgram, targetFD int) (*BpfLink, error)
 	}{
-		{"target", "xdp_pass", func(p *BpfProgram) (*BpfLink, error) {
-			return BpfProgramAttachFreplace(p, targetProg.fd, "xdp_pass")
+		{"target", "xdp_pass", func(p *BpfProgram, targetFD int) (*BpfLink, error) {
+			return BpfProgramAttachFreplace(p, targetFD, "xdp_pass")
 		}},
-		{"no target", "", func(p *BpfProgram) (*BpfLink, error) { return BpfProgramAttachFreplace(p, 0, "") }},
-		{"section", "", func(p *BpfProgram) (*BpfLink, error) { return BpfProgramAttach(p) }},
+		{"no target", "", func(p *BpfProgram, _ int) (*BpfLink, error) { return BpfProgramAttachFreplace(p, 0, "") }},
+		{"section", "", func(p *BpfProgram, _ int) (*BpfLink, error) { return BpfProgramAttach(p) }},
 	}
 	for _, a := range attaches {
 		t.Run(a.name, func(t *testing.T) {
+			target := loadTestObject(t, progsDir+"/xdp.bpf.o")
+			defer BpfObjectClose(target)
+			targetProg := findProgram(t, target, "xdp_pass")
+			checkProgramBtfID(t, target, targetProg)
+			fn := target.btf.Find("xdp_pass", btf.KindFunc)
+			if fn == nil {
+				t.Fatal("xdp.bpf.o BTF has no FUNC xdp_pass")
+			}
+
 			obj := loadFreplaceObject(t, "freplace.bpf.o", "replace_xdp", targetProg.fd, a.loadName)
 			defer BpfObjectClose(obj)
 			prog := findProgram(t, obj, "replace_xdp")
-			checkFreplaceAttach(t, prog, a.attach, targetProg.id, fn.ID)
+			attach := func(p *BpfProgram) (*BpfLink, error) { return a.attach(p, targetProg.fd) }
+			checkFreplaceAttach(t, prog, attach, targetProg.id, fn.ID)
 		})
 	}
 }
@@ -168,7 +172,8 @@ func TestBpfProgramAttachFreplace(t *testing.T) {
 // xdp_pass of the loaded xdp.bpf.o, and attaches it through the section name
 // to that load-time target. With the target descriptor alone the load fails
 // with EINVAL, because the section names no function to look up. It skips
-// with the kernel's errno when the kernel BTF has no program extensions.
+// with the kernel's errno when the kernel BTF has no program extensions or
+// the kernel cannot attach them, see checkFreplaceAttach.
 func TestBpfProgramAttachFreplaceBare(t *testing.T) {
 	target := loadTestObject(t, progsDir+"/xdp.bpf.o")
 	defer BpfObjectClose(target)
@@ -188,7 +193,10 @@ func TestBpfProgramAttachFreplaceBare(t *testing.T) {
 
 // checkFreplaceAttach attaches prog with attach and checks the tracing
 // link: its type, program and attach type 0, and the target program id and
-// the BTF id of the replaced function in its fdinfo.
+// the BTF id of the replaced function in its fdinfo. It skips when bpf() is
+// not permitted, when the kernel BTF has no program extensions, and with
+// ENOTSUPP (524), which a kernel that cannot patch the target returns: arm64
+// has no BPF trampoline or text poke before 6.0.
 func checkFreplaceAttach(t *testing.T, prog *BpfProgram, attach func(*BpfProgram) (*BpfLink, error), targetID, btfID uint32) {
 	t.Helper()
 
@@ -196,6 +204,9 @@ func checkFreplaceAttach(t *testing.T, prog *BpfProgram, attach func(*BpfProgram
 	if err != nil {
 		skipIfNotPermitted(t, err)
 		skipIfKernelLacks(t, "program extensions", kernelEnumHas(t, "bpf_prog_type", "BPF_PROG_TYPE_EXT"), err)
+		if errors.Is(err, enotsupp) {
+			t.Skipf("kernel cannot attach program extensions, no BPF trampoline or text poke as on arm64 before 6.0: %v", err)
+		}
 		t.Fatalf("attach: %v", err)
 	}
 	checkLinkFdinfo(t, link, prog, "tracing", map[string]string{"attach_type": "0"})
